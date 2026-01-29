@@ -34,6 +34,9 @@ RUN pnpm install --frozen-lockfile
 # Copy the rest of the repo
 COPY . .
 
+# Give Node/tsc more heap during build to avoid OOM
+ENV NODE_OPTIONS="--max-old-space-size=2048"
+
 # Build backend
 RUN CLAWDBOT_A2UI_SKIP_MISSING=1 pnpm build
 
