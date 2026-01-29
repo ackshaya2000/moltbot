@@ -1,74 +1,56 @@
-# -------------------------
-# 1) Builder stage
-# -------------------------
+# ---------- builder ----------
 FROM node:22-bookworm AS builder
 
-# Enable pnpm (corepack)
-RUN corepack enable
+# Make pnpm available via corepack
+RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
+
+# CI mode prevents pnpm prune from requiring a TTY
+ENV CI=true
+
+# Put caches in writable temp locations
+ENV NPM_CONFIG_CACHE=/tmp/.npm
+ENV XDG_CACHE_HOME=/tmp/.cache
+ENV PNPM_HOME=/tmp/.pnpm
+ENV PATH="/tmp/.pnpm:${PATH}"
 
 WORKDIR /app
 
-# (Optional) Extra apt packages hook
-ARG CLAWDBOT_DOCKER_APT_PACKAGES=""
-RUN if [ -n "$CLAWDBOT_DOCKER_APT_PACKAGES" ]; then \
-      apt-get update && \
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $CLAWDBOT_DOCKER_APT_PACKAGES && \
-      apt-get clean && \
-      rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
-    fi
-
-# IMPORTANT: Railway 1GB plans often SIGKILL TypeScript builds.
-# This caps TS/Node memory during build to reduce OOM kills.
-# You can tweak 768 -> 896 if needed, but stay < 1GB overall.
-ENV NODE_OPTIONS="--max-old-space-size=768"
-
-# Copy only dependency manifests first for better Docker caching
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY ui/package.json ./ui/package.json
 COPY patches ./patches
 COPY scripts ./scripts
 
-# Install deps
 RUN pnpm install --frozen-lockfile
 
-# Copy the rest of the repo
 COPY . .
 
-# Give Node/tsc more heap during build to avoid OOM
+# If you still OOM here, you simply need a bigger builder (see note below)
 ENV NODE_OPTIONS="--max-old-space-size=2048"
 
-# Build backend
 RUN CLAWDBOT_A2UI_SKIP_MISSING=1 pnpm build
 
-# Build UI (force pnpm as you had)
+# Force pnpm for UI build
 ENV CLAWDBOT_PREFER_PNPM=1
 RUN pnpm ui:install
 RUN pnpm ui:build
 
-# Prune to production deps only (smaller runtime + fewer issues)
+# Prune dev deps for runtime image
 RUN pnpm prune --prod
 
-
-# -------------------------
-# 2) Runtime stage
-# -------------------------
-FROM node:22-bookworm AS runtime
+# ---------- runtime ----------
+FROM node:22-bookworm-slim AS runtime
 
 ENV NODE_ENV=production
+ENV NPM_CONFIG_CACHE=/tmp/.npm
+ENV XDG_CACHE_HOME=/tmp/.cache
 
-# Use the existing 'node' user (uid 1000)
-USER node
 WORKDIR /app
 
-# Copy only what we need from the builder
-COPY --from=builder /app/package.json ./package.json
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/dist ./dist
+# Copy built app + prod deps
+COPY --from=builder /app /app
 
-# If your runtime also needs UI artifacts, copy them too.
-# (Keep whichever paths exist in your repo after ui:build.)
-COPY --from=builder /app/ui ./ui
+# Run as non-root
+USER node
 
-# Railway will inject PORT. Your app should bind to 0.0.0.0:$PORT internally.
 CMD ["node", "dist/index.js"]
 
