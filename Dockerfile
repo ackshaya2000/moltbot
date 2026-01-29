@@ -1,13 +1,14 @@
-FROM node:22-bookworm
+# -------------------------
+# 1) Builder stage
+# -------------------------
+FROM node:22-bookworm AS builder
 
-# Install Bun (required for build scripts)
-RUN curl -fsSL https://bun.sh/install | bash
-ENV PATH="/root/.bun/bin:${PATH}"
-
+# Enable pnpm (corepack)
 RUN corepack enable
 
 WORKDIR /app
 
+# (Optional) Extra apt packages hook
 ARG CLAWDBOT_DOCKER_APT_PACKAGES=""
 RUN if [ -n "$CLAWDBOT_DOCKER_APT_PACKAGES" ]; then \
       apt-get update && \
@@ -16,25 +17,55 @@ RUN if [ -n "$CLAWDBOT_DOCKER_APT_PACKAGES" ]; then \
       rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
     fi
 
+# IMPORTANT: Railway 1GB plans often SIGKILL TypeScript builds.
+# This caps TS/Node memory during build to reduce OOM kills.
+# You can tweak 768 -> 896 if needed, but stay < 1GB overall.
+ENV NODE_OPTIONS="--max-old-space-size=768"
+
+# Copy only dependency manifests first for better Docker caching
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY ui/package.json ./ui/package.json
 COPY patches ./patches
 COPY scripts ./scripts
 
+# Install deps
 RUN pnpm install --frozen-lockfile
 
+# Copy the rest of the repo
 COPY . .
+
+# Build backend
 RUN CLAWDBOT_A2UI_SKIP_MISSING=1 pnpm build
-# Force pnpm for UI build (Bun may fail on ARM/Synology architectures)
+
+# Build UI (force pnpm as you had)
 ENV CLAWDBOT_PREFER_PNPM=1
 RUN pnpm ui:install
 RUN pnpm ui:build
 
+# Prune to production deps only (smaller runtime + fewer issues)
+RUN pnpm prune --prod
+
+
+# -------------------------
+# 2) Runtime stage
+# -------------------------
+FROM node:22-bookworm AS runtime
+
 ENV NODE_ENV=production
 
-# Security hardening: Run as non-root user
-# The node:22-bookworm image includes a 'node' user (uid 1000)
-# This reduces the attack surface by preventing container escape via root privileges
+# Use the existing 'node' user (uid 1000)
 USER node
+WORKDIR /app
 
+# Copy only what we need from the builder
+COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/dist ./dist
+
+# If your runtime also needs UI artifacts, copy them too.
+# (Keep whichever paths exist in your repo after ui:build.)
+COPY --from=builder /app/ui ./ui
+
+# Railway will inject PORT. Your app should bind to 0.0.0.0:$PORT internally.
 CMD ["node", "dist/index.js"]
+
